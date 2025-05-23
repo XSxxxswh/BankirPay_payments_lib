@@ -75,7 +75,7 @@ pub async fn new_payment (state: Arc<State>, merchant_id: String, request: NewPa
     while let Some(Ok(result)) = futures.next().await {
         if let Some((requisite, trader_builder, _guard)) = result? {
             if let Err(err) = state.trader_api.clone().change_balance(requisite.trader_id.clone(),
-                                                        payment.trader_crypto_amount.to_f64().unwrap(),
+                                                        trader_builder.trader_crypto_amount.to_f64().unwrap(),
                                                         BalanceActionType::FrozeSoft).await
             {
                 if err == LibError::Conflict || err == LibError::InsufficientFunds || err == LibError::NotFound {
