@@ -43,7 +43,7 @@ impl IntoResponse for PaymentError {
             PaymentError::InvalidPaymentSide => payment_error_build!(400, "Invalid Payment Side"),
             PaymentError::InvalidFeeType => payment_error_build!(400, "Invalid Payment Type"),
             PaymentError::InvalidCurrencyType => payment_error_build!(400, "Invalid Payment Currency"),
-            PaymentError::NoAvailableRequisites => payment_error_build!(406, "No payment available"),
+            PaymentError::NoAvailableRequisites => payment_error_build!(406, "No available requisites"),
             PaymentError::InternalServerError => payment_error_build!(500, "Internal server error"),
             PaymentError::InsufficientFunds => payment_error_build!(400, "Insufficient funds"),
             PaymentError::AccessDenied(_) => payment_error_build!(403, "Access denied"),
