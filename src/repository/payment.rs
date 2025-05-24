@@ -202,7 +202,9 @@ pub async fn close_payment_by_hand(client: &mut tokio_postgres::Client, issuer: 
         query_params.push((&payment_id, Type::VARCHAR));
         query.push_str(format!(" WHERE id= ${}", param_index).as_str());
     }
-    query.push_str(" AND status IN ('UNPAID', 'PAID') RETURNING *");
+    query.push_str(" AND status IN ('UNPAID', 'PAID', 'CANCELLED_BY_TIMEOUT', \
+    'CANCELLED_BY_ADMIN', 'CANCELLED_BY_ADMIN', 'CANCELLED_BY_TRADER', \
+    'CANCELLED_BY_MERCHANT', 'CANCELLED_BY_CUSTOMER') RETURNING *");
     debug!("executing query {}", query);
     let rows = map_err_with_log!(client.query_typed(&query, &query_params).await, 
         "Error start SQL transaction to close payment", 
