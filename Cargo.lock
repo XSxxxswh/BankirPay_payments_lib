@@ -171,7 +171,7 @@ dependencies = [
 [[package]]
 name = "bankirpay_lib"
 version = "0.1.0"
-source = "git+https://github.com/XSxxxswh/BankirPay_lib.git?rev=d2f94c7053c1c9b22a756fc1adfe1cd4089e6648#d2f94c7053c1c9b22a756fc1adfe1cd4089e6648"
+source = "git+https://github.com/XSxxxswh/BankirPay_lib.git?rev=410831f4ac90705f19f7ebe709fe5cfdf1f08c9f#410831f4ac90705f19f7ebe709fe5cfdf1f08c9f"
 dependencies = [
  "async-trait",
  "axum",
