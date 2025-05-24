@@ -1,6 +1,6 @@
 use axum::http::{Response};
 use axum::response::IntoResponse;
-
+use bankirpay_lib::errors::LibError;
 
 #[derive(thiserror::Error, Debug, PartialEq)]
 pub enum PaymentError {
@@ -72,6 +72,23 @@ impl std::fmt::Display for PaymentError {
             Self::InvalidCurrency => write!(f, "Invalid currency"),
             Self::SellPaymentsUnavailable => write!(f, "Sell Payments Unavailable"),
 
+        }
+    }
+}
+
+impl From<LibError> for PaymentError {
+    fn from(error: LibError) -> Self {
+        match error {
+            LibError::TraderNotFound => Self::NotFound,
+            LibError::Forbidden => Self::InternalServerError,
+            LibError::Unauthorized => Self::AccessDenied(String::from("Unauthorized")),
+            LibError::InternalError => Self::InternalServerError,
+            LibError::MerchantNotFound => Self::NotFound,
+            LibError::NotFound => Self::NotFound,
+            LibError::NoAvailableRequisites => Self::NoAvailableRequisites,
+            LibError::InsufficientFunds => Self::InsufficientFunds,
+            LibError::InvalidAmount => Self::InvalidAmount,
+            LibError::Conflict => Self::Conflict,
         }
     }
 }

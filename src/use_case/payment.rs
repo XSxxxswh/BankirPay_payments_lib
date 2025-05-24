@@ -34,7 +34,7 @@ use crate::repository::requisite::release_lock;
 use crate::use_case::from_lib_to_pe;
 
 pub async fn new_payment (state: Arc<State>, merchant_id: String, request: NewPaymentRequest) -> Result<MerchantPayment, PaymentError> {
-    let merchant_margin = use_case::merchant::get_merchant_margin(state.clone(), merchant_id.as_str(), request.method_id.deref()).await?;
+    let (merchant_margin, exchange_rate) = tokio::try_join!(use_case::merchant::get_merchant_margin(state.clone(), merchant_id.as_str(), request.method_id.deref()), use_case::exchange_rate::get_exchange_rate(state.clone()))?;
     if merchant_margin.currency.to_lowercase() != request.currency.to_lowercase() {
         return Err(InvalidCurrency)
     }
@@ -45,7 +45,6 @@ pub async fn new_payment (state: Arc<State>, merchant_id: String, request: NewPa
     };
     let mut conn = state.rdb.get().await.unwrap();
     let pg = Arc::new(state.pool.get().await.map_err(|_| InternalServerError)?);
-    let exchange_rate = get_exchange_rate();
     let mut payment = calculate_fee_for_merchant(request, &merchant_margin, exchange_rate, merchant_id)?;
     let requisites = state.requisite_api.clone().get_requisites_for_payment(merchant_margin.method_type, payment.fiat_amount.to_f64().unwrap(), payment.currency.to_string(), merchant_margin.bank, cb_allow).await.map_err(from_lib_to_pe)?;
     let chunks = requisites.chunks(50);
@@ -233,9 +232,6 @@ fn calculate_trader_fee(
         trader_crypto_fee: crypto_fee.round_dp(2),
         trader_crypto_amount: crypto_amount.round_dp(2),
     })
-}
-fn get_exchange_rate() -> Decimal {
-    Decimal::from_f64(88.7).unwrap()
 }
 
 

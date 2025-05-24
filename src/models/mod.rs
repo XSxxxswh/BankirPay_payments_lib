@@ -11,6 +11,7 @@ pub struct State {
     pub trader_api: bankirpay_lib::services::traders::trader_service::TraderService,
     pub merchant_api: bankirpay_lib::services::merchants::merchant_service::MerchantService,
     pub requisite_api: bankirpay_lib::services::requisites::requisite_service::RequisitesService,
+    pub exchange_api: bankirpay_lib::services::exchange::exchange_service::ExchangeService,
     pub kafka_producer: FutureProducer
 }
 
