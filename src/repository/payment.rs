@@ -5,13 +5,14 @@ use bankirpay_lib::{map_err_with_log};
 use bankirpay_lib::models::payments::payment::{FullPayment, PaymentStatuses, ToSQL};
 use bankirpay_lib::models::payments::requests::GetPaymentsRequest;
 use rust_decimal::Decimal;
-use tokio_postgres::{GenericClient};
+use tokio_postgres::{GenericClient, Transaction};
 use tokio_postgres::types::{ToSql, Type};
 use tonic::codegen::tokio_stream::StreamExt;
 use tracing::{debug, error, warn};
 use crate::errors::payment_error::PaymentError;
 use crate::errors::payment_error::PaymentError::{InternalServerError, NotFound};
 use rust_decimal::prelude::FromPrimitive;
+use simd_json::prelude::ArrayTrait;
 
 pub async fn insert_payment_to_db(client: &tokio_postgres::Client, payment: &FullPayment) -> Result<(), PaymentError>{
     debug!(payment_id=%payment.id, "Inserting new payment to DB");
@@ -175,24 +176,15 @@ pub async fn close_payment(client: &mut tokio_postgres::Client, notify: &bankirp
     Err(NotFound)
 }
 
-pub async fn close_payment_by_hand(client: &mut tokio_postgres::Client, issuer: GetPaymentsRequest, payment_id: &str, amount: Option<Decimal>)
+pub async fn close_payment_by_hand(client: &tokio_postgres::Client, issuer: &GetPaymentsRequest, payment_id: &str)
 -> Result<FullPayment, PaymentError>
 {
     let mut query = String::from("UPDATE payments SET status = 'COMPLETED', close_by = $1, updated_at = NOW()");
     let mut query_params: Vec<(&(dyn ToSql + Sync), Type)> = vec![];
     let mut param_index = 2;
-    query_params.push(match issuer {
-        GetPaymentsRequest::Trader(_) => {
-            (&"HAND_TRADER", Type::VARCHAR)
-        },
-        GetPaymentsRequest::Admin(_) => {
-            (&"HAND_ADMIN", Type::VARCHAR)
-        },
-        GetPaymentsRequest::Merchant(_) => {
-            (&"HAND_MERCHANT", Type::VARCHAR)
-        }
-    });
-    let (query_conditions, params) = issuer.single_query(Some(&mut param_index));
+    query_params.push(get_close_by_for_sql(issuer));
+    let (query_conditions, params) = issuer.single_query(Some(&mut param_index)); // where возвращается когда это не админ, 
+    // когда админ то все пусто
     query.push_str(&query_conditions);
     if let Some(id) = params.as_ref() {
         query_params.push((id, Type::VARCHAR));
@@ -216,6 +208,87 @@ pub async fn close_payment_by_hand(client: &mut tokio_postgres::Client, issuer: 
     Ok(FullPayment::from(rows.first().ok_or(NotFound)?))
 }
 
+// получение платежа для перерасчета (открывается транзакция и она возвращается)
+pub async fn get_payment_for_recalculate<'a>(client: &'a mut tokio_postgres::Client, payment_id: &str, request: &GetPaymentsRequest)
+-> Result<(Transaction<'a>,FullPayment), PaymentError>
+{
+    let mut query = String::from("SELECT * payments");
+    let mut query_params: Vec<(&(dyn ToSql + Sync), Type)> = vec![];
+    let mut param_index = 1;
+    let (query_conditions, params) = request.single_query(Some(&mut param_index)); // where возвращается когда это не админ, 
+    // когда админ то все пусто
+    query.push_str(&query_conditions);
+    if let Some(id) = params.as_ref() {
+        query_params.push((id, Type::VARCHAR));
+        query.push_str(format!(" AND id = ${}", param_index).as_str());
+        query_params.push((&payment_id, Type::VARCHAR));
+    }else {
+        query_params.push((&payment_id, Type::VARCHAR));
+        query.push_str(format!(" WHERE id= ${}", param_index).as_str());
+    }
+    query.push_str(" FOR UPDATE");
+    let tx = map_err_with_log!(client.transaction().await, 
+        "Error create payment transaction", InternalServerError, payment_id)?;
+    let rows = map_err_with_log!(tx.query_typed(&query, &query_params).await, 
+        "Error start SQL transaction to close payment",InternalServerError,payment_id)?;
+    if rows.is_empty() {
+        return Err(NotFound);
+    }
+    Ok((tx, FullPayment::from(rows.first().unwrap())))
+}
+
+pub async fn close_recalculated_payment(tx: Transaction<'_>, payment: &FullPayment, request: &GetPaymentsRequest)
+-> Result<(), PaymentError>
+{
+    let mut query = String::from(r#"
+    UPDATE payments SET
+    status = 'COMPLETED',
+    target_amount = $1,
+    fiat_amount = $2,
+    crypto_amount = $3,
+    trader_crypto_amount = $4,
+    crypto_fee = $5,
+    fiat_fee = $6,
+    trader_crypto_fee = $7,
+    trader_fiat_fee = $8,
+    close_by = $9"#);
+    let mut query_params: Vec<(&(dyn ToSql + Sync), Type)> = vec![
+        (&payment.target_amount, Type::NUMERIC),
+        (&payment.fiat_amount, Type::NUMERIC),
+        (&payment.crypto_amount, Type::NUMERIC),
+        (&payment.trader_crypto_amount, Type::NUMERIC),
+        (&payment.crypto_fee, Type::NUMERIC),
+        (&payment.fiat_fee, Type::NUMERIC),
+        (&payment.trader_crypto_fee, Type::NUMERIC),
+        (&payment.trader_fiat_fee, Type::NUMERIC),
+    ];
+    
+    query_params.push(get_close_by_for_sql(request));
+    let mut param_index = 10;
+    let (query_conditions, params) = request.single_query(Some(&mut param_index)); // where возвращается когда это не админ, 
+    // когда админ то все пусто
+    query.push_str(&query_conditions);
+    if let Some(id) = params.as_ref() {
+        query_params.push((id, Type::VARCHAR));
+        query.push_str(format!(" AND id = ${}", param_index).as_str());
+        query_params.push((&payment.id, Type::VARCHAR));
+    }else {
+        query_params.push((&payment.id, Type::VARCHAR));
+        query.push_str(format!(" WHERE id= ${}", param_index).as_str());
+    }
+    query.push_str(" AND status IN ('UNPAID', 'PAID', 'CANCELLED_BY_TIMEOUT', \
+    'CANCELLED_BY_ADMIN', 'CANCELLED_BY_ADMIN', 'CANCELLED_BY_TRADER', \
+    'CANCELLED_BY_MERCHANT', 'CANCELLED_BY_CUSTOMER') RETURNING id");
+    debug!("executing query {}", query);
+    let payment_id = payment.id.clone();
+    let rows = map_err_with_log!(tx.query_typed(&query, &query_params).await, 
+        "Error update payment in DB", InternalServerError, payment_id)?;
+    if rows.is_empty() {
+        return Err(NotFound);
+    }
+    map_err_with_log!(tx.commit().await, "Error committing transaction to payment", InternalServerError, payment_id)?;
+    Ok(())
+}
 pub async fn cancel_payment_auto(client: &tokio_postgres::Client)
                                  -> Result<Vec<FullPayment>, PaymentError>
 {
@@ -229,3 +302,18 @@ pub async fn cancel_payment_auto(client: &tokio_postgres::Client)
     Ok(result.into_iter().map(FullPayment::from).collect::<Vec<FullPayment>>())
 }
 
+fn get_close_by_for_sql(request: &GetPaymentsRequest)
+-> (&(dyn ToSql + Sync), Type)
+{
+    match request {
+        GetPaymentsRequest::Trader(_) => {
+            (&"HAND_TRADER", Type::VARCHAR)
+        },
+        GetPaymentsRequest::Admin(_) => {
+            (&"HAND_ADMIN", Type::VARCHAR)
+        },
+        GetPaymentsRequest::Merchant(_) => {
+            (&"HAND_MERCHANT", Type::VARCHAR)
+        }
+    }
+}

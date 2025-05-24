@@ -47,7 +47,7 @@ pub async fn new_payment (state: Arc<State>, merchant_id: String, request: NewPa
     let pg = Arc::new(state.pool.get().await.map_err(|_| InternalServerError)?);
     let mut payment = calculate_fee_for_merchant(request, &merchant_margin, exchange_rate, merchant_id)?;
     let requisites = state.requisite_api.clone().get_requisites_for_payment(merchant_margin.method_type, payment.fiat_amount.to_f64().unwrap(), payment.currency.to_string(), merchant_margin.bank, cb_allow).await.map_err(from_lib_to_pe)?;
-    let chunks = requisites.chunks(50);
+    let chunks = requisites.chunks((requisites.len() / 4).max(1));
     let cancellation_token = CancellationToken::new();
     let payment_side = Arc::new(payment.payment_side);
     let mut futures = FuturesUnordered::new();
@@ -96,7 +96,7 @@ pub async fn new_payment (state: Arc<State>, merchant_id: String, request: NewPa
             payment.holder_account = requisite.holder_account;
             payment.last_four = requisite.last_four;
             payment.card_last_four = requisite.card_last_four;
-            payment.earnings = payment.trader_crypto_fee - payment.crypto_fee;
+            payment.earnings = payment.crypto_fee - payment.trader_crypto_fee;
             payment.method = requisite.method;
             repository::payment::insert_payment_to_db(&pg, &payment).await?;
             cancellation_token.cancel();
@@ -108,20 +108,6 @@ pub async fn new_payment (state: Arc<State>, merchant_id: String, request: NewPa
 }
 
 
-fn full_payment_from_builder_and_requisite(payment: &mut FullPayment,builder: TraderPaymentBuilder, requisite: Requisite)
-{
-    payment.trader_id = requisite.trader_id;
-    payment.trader_margin = builder.trader_margin;
-    payment.trader_fiat_fee = builder.trader_fiat_fee;
-    payment.trader_crypto_fee = builder.trader_crypto_fee;
-    payment.trader_crypto_amount =builder.trader_crypto_amount;
-    payment.requisite_id = requisite.id.clone();
-    payment.bank_id = requisite.bank_id;
-    payment.bank_name = requisite.bank_name;
-    payment.holder_name = requisite.holder_name;
-    payment.holder_account = requisite.holder_account;
-    payment.earnings = payment.trader_crypto_fee - payment.crypto_fee;
-}
 
 async fn process_requisite_chunk(
     conn: MultiplexedConnection,
@@ -287,13 +273,21 @@ pub async fn close_payment_by_notification(state: Arc<models::State>, notificati
     Ok(())
 }
 
-pub async fn close_payment_by_hand<T>(state: Arc<models::State>, issuer: GetPaymentsRequest, payment_id: &str, amount: Option<Decimal>)
+pub async fn close_payment_by_hand<T>(state: Arc<models::State>, issuer: GetPaymentsRequest, payment_id: &str, final_amount: Option<Decimal>)
 -> Result<T, PaymentError>
 where T: From<FullPayment>
 {
     debug!(payment_id=payment_id,issuer=?issuer,"Closing payment by hand");
     let mut pg = map_err_with_log!(state.pool.get().await, "Error get pg connection to close payment", InternalServerError, payment_id)?;
-    let payment = repository::payment::close_payment_by_hand(&mut pg, issuer, payment_id, amount).await?;
+    let payment = match final_amount {
+        Some(final_amount) => {
+            let (tx, mut payment) = repository::payment::get_payment_for_recalculate(&mut pg, payment_id, &issuer).await?;
+            recalculate_payment(&mut payment, final_amount).await?;
+            repository::payment::close_recalculated_payment(tx, &payment, &issuer).await?;
+            payment
+        },
+        None => repository::payment::close_payment_by_hand(&mut pg, &issuer, payment_id).await?
+    };
     send_kafka_message(&state.kafka_producer, payment.clone()).await;
     Ok(T::from(payment))
 }
@@ -321,20 +315,58 @@ pub async fn auto_cancel_worker(state: Arc<State>)
 pub async fn send_kafka_message(producer: &FutureProducer, payment: FullPayment) {
     let id = payment.id.clone();
     let payload = PaymentProto::from(payment).encode_to_vec();
-   let record = rdkafka::producer::FutureRecord::to("PAYMENT_EVENTS")
-       .key(&id)
-       .payload(&payload);
-    match producer.send(record, Duration::from_secs(5)).await {
-        Ok(f) => {
-            debug!("Sent kafka message {:?}", f);
-        },
-        Err(e) => {
-            warn!(err=e.0.to_string(), "Error sending kafka message");
+    for i in 0..3 {
+        if i > 0 {
+            warn!("Kafka retry send attempt {}", i);
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        }
+        let record = rdkafka::producer::FutureRecord::to("PAYMENT_EVENTS")
+            .key(&id)
+            .payload(&payload);
+        match producer.send(record, Duration::from_secs(5)).await {
+            Ok(f) => {
+                debug!("Sent kafka message {:?}", f);
+                break
+            },
+            Err((e, _)) => {
+                warn!(err=e.to_string(), "Error sending kafka message");
+                continue
+            }
         }
     }
+   
 }
 
-
+async fn recalculate_payment(payment: &mut FullPayment, amount: Decimal) 
+-> Result<(), PaymentError>
+{
+    payment.fiat_amount = amount;
+    let fee_percent = payment.margin / dec!(100);
+    let builder = calculate_trader_fee(amount, 
+                                       payment.trader_margin, 
+                                       payment.exchange_rate, 
+                                       &payment.payment_side)?;
+    payment.trader_crypto_fee = builder.trader_crypto_fee;
+    payment.trader_fiat_fee = builder.trader_fiat_fee;
+    payment.trader_crypto_amount = builder.trader_crypto_amount;
+    match &payment.fee_type {
+        FeeTypes::ChargeCustomer => {
+            payment.target_amount = (amount / (dec!(1) + fee_percent)).round_dp(2);
+            payment.fiat_fee = (payment.target_amount * fee_percent).round_dp(2);
+            let crypto_amount_base = payment.target_amount / payment.exchange_rate;
+            payment.crypto_amount = crypto_amount_base.round_dp(2);
+            payment.crypto_fee = (crypto_amount_base * fee_percent).round_dp(2);
+        }
+        FeeTypes::ChargeMerchant => {
+            payment.target_amount = amount;
+            payment.fiat_fee = (payment.target_amount * fee_percent).round_dp(2);
+            let crypto_amount_base = payment.target_amount / payment.exchange_rate;
+            payment.crypto_fee = (crypto_amount_base * fee_percent).round_dp(2);
+            payment.crypto_amount = (crypto_amount_base - payment.crypto_fee).round_dp(2);
+        }
+    }
+    Ok(())
+}
 
 pub async fn kafka_worker_start(consumer: StreamConsumer, state: Arc<models::State>)
 {
