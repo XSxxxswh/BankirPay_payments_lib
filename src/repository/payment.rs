@@ -183,7 +183,7 @@ pub async fn close_payment_by_hand(client: &tokio_postgres::Client, issuer: &Get
     let mut query_params: Vec<(&(dyn ToSql + Sync), Type)> = vec![];
     let mut param_index = 2;
     query_params.push(get_close_by_for_sql(issuer));
-    let (query_conditions, params) = issuer.single_query(Some(&mut param_index)); // where возвращается когда это не админ, 
+    let (query_conditions, params) = issuer.single_query(Some(&mut param_index)); // where возвращается когда это не админ,
     // когда админ то все пусто
     query.push_str(&query_conditions);
     if let Some(id) = params.as_ref() {
@@ -212,10 +212,10 @@ pub async fn close_payment_by_hand(client: &tokio_postgres::Client, issuer: &Get
 pub async fn get_payment_for_recalculate<'a>(client: &'a mut tokio_postgres::Client, payment_id: &str, request: &GetPaymentsRequest)
 -> Result<(Transaction<'a>,FullPayment), PaymentError>
 {
-    let mut query = String::from("SELECT * payments");
+    let mut query = String::from("SELECT * FROM payments");
     let mut query_params: Vec<(&(dyn ToSql + Sync), Type)> = vec![];
     let mut param_index = 1;
-    let (query_conditions, params) = request.single_query(Some(&mut param_index)); // where возвращается когда это не админ, 
+    let (query_conditions, params) = request.single_query(Some(&mut param_index)); // where возвращается когда это не админ,
     // когда админ то все пусто
     query.push_str(&query_conditions);
     if let Some(id) = params.as_ref() {
@@ -227,9 +227,10 @@ pub async fn get_payment_for_recalculate<'a>(client: &'a mut tokio_postgres::Cli
         query.push_str(format!(" WHERE id= ${}", param_index).as_str());
     }
     query.push_str(" FOR UPDATE");
-    let tx = map_err_with_log!(client.transaction().await, 
+    println!("executing query {}", query);
+    let tx = map_err_with_log!(client.transaction().await,
         "Error create payment transaction", InternalServerError, payment_id)?;
-    let rows = map_err_with_log!(tx.query_typed(&query, &query_params).await, 
+    let rows = map_err_with_log!(tx.query_typed(&query, &query_params).await,
         "Error start SQL transaction to close payment",InternalServerError,payment_id)?;
     if rows.is_empty() {
         return Err(NotFound);
@@ -262,10 +263,10 @@ pub async fn close_recalculated_payment(tx: Transaction<'_>, payment: &FullPayme
         (&payment.trader_crypto_fee, Type::NUMERIC),
         (&payment.trader_fiat_fee, Type::NUMERIC),
     ];
-    
+
     query_params.push(get_close_by_for_sql(request));
     let mut param_index = 10;
-    let (query_conditions, params) = request.single_query(Some(&mut param_index)); // where возвращается когда это не админ, 
+    let (query_conditions, params) = request.single_query(Some(&mut param_index)); // where возвращается когда это не админ,
     // когда админ то все пусто
     query.push_str(&query_conditions);
     if let Some(id) = params.as_ref() {
@@ -281,7 +282,7 @@ pub async fn close_recalculated_payment(tx: Transaction<'_>, payment: &FullPayme
     'CANCELLED_BY_MERCHANT', 'CANCELLED_BY_CUSTOMER') RETURNING id");
     debug!("executing query {}", query);
     let payment_id = payment.id.clone();
-    let rows = map_err_with_log!(tx.query_typed(&query, &query_params).await, 
+    let rows = map_err_with_log!(tx.query_typed(&query, &query_params).await,
         "Error update payment in DB", InternalServerError, payment_id)?;
     if rows.is_empty() {
         return Err(NotFound);
