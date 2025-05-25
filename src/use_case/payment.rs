@@ -279,16 +279,14 @@ where T: From<FullPayment>
 {
     debug!(payment_id=payment_id,issuer=?issuer,"Closing payment by hand");
     let mut pg = map_err_with_log!(state.pool.get().await, "Error get pg connection to close payment", InternalServerError, payment_id)?;
-    let mut payment = match final_amount {
+    let payment = match final_amount {
         Some(final_amount) => {
             let (tx, mut payment) = repository::payment::get_payment_for_recalculate(&mut pg, payment_id, &issuer).await?;
             recalculate_payment(&mut payment, final_amount).await?;
-            repository::payment::close_recalculated_payment(tx, &payment, &issuer).await?;
-            payment
+            repository::payment::close_recalculated_payment(tx, &payment, &issuer).await?
         },
         None => repository::payment::close_payment_by_hand(&mut pg, &issuer, payment_id).await?
     };
-    payment.status = PaymentStatuses::Completed;
     send_kafka_message(&state.kafka_producer, payment.clone()).await;
     Ok(T::from(payment))
 }

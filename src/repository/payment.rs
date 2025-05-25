@@ -239,7 +239,7 @@ pub async fn get_payment_for_recalculate<'a>(client: &'a mut tokio_postgres::Cli
 }
 
 pub async fn close_recalculated_payment(tx: Transaction<'_>, payment: &FullPayment, request: &GetPaymentsRequest)
--> Result<(), PaymentError>
+-> Result<FullPayment, PaymentError>
 {
     let mut query = String::from(r#"
     UPDATE payments SET
@@ -279,7 +279,7 @@ pub async fn close_recalculated_payment(tx: Transaction<'_>, payment: &FullPayme
     }
     query.push_str(" AND status IN ('UNPAID', 'PAID', 'CANCELLED_BY_TIMEOUT', \
     'CANCELLED_BY_ADMIN', 'CANCELLED_BY_ADMIN', 'CANCELLED_BY_TRADER', \
-    'CANCELLED_BY_MERCHANT', 'CANCELLED_BY_CUSTOMER') RETURNING id");
+    'CANCELLED_BY_MERCHANT', 'CANCELLED_BY_CUSTOMER') RETURNING *");
     debug!("executing query {}", query);
     let payment_id = payment.id.clone();
     let rows = map_err_with_log!(tx.query_typed(&query, &query_params).await,
@@ -288,7 +288,7 @@ pub async fn close_recalculated_payment(tx: Transaction<'_>, payment: &FullPayme
         return Err(NotFound);
     }
     map_err_with_log!(tx.commit().await, "Error committing transaction to payment", InternalServerError, payment_id)?;
-    Ok(())
+    Ok(FullPayment::from(rows.first().unwrap()))
 }
 pub async fn cancel_payment_auto(client: &tokio_postgres::Client)
                                  -> Result<Vec<FullPayment>, PaymentError>
