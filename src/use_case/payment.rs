@@ -301,6 +301,7 @@ where T: From<FullPayment>
         },
         None => repository::payment::close_payment_by_hand(&mut pg, &issuer, payment_id).await?
     };
+    println!("{:?}",payment.updated_at);
     send_kafka_message(&state.kafka_producer, payment.clone()).await;
     Ok(T::from(payment))
 }
