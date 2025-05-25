@@ -244,6 +244,7 @@ pub async fn close_recalculated_payment(tx: Transaction<'_>, payment: &FullPayme
     let mut query = String::from(r#"
     UPDATE payments SET
     status = 'COMPLETED',
+    updated_at = NOW(),
     target_amount = $1,
     fiat_amount = $2,
     crypto_amount = $3,
