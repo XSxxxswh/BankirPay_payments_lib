@@ -283,11 +283,12 @@ where T: From<FullPayment>
     let payment = match final_amount {
         Some(final_amount) => {
             let (tx, mut payment) = repository::payment::get_payment_for_recalculate(&mut pg, payment_id, &issuer).await?;
+            let previous_amount = payment.trader_crypto_amount;
             recalculate_payment(&mut payment, final_amount).await?;
             let final_payment = repository::payment::close_recalculated_payment(tx, &payment, &issuer).await?;
             match payment.status {
                 c if !c.is_final() => {
-                    let amount_to_froze = final_payment.trader_crypto_amount - payment.trader_crypto_amount;
+                    let amount_to_froze = final_payment.trader_crypto_amount - previous_amount;
                     let _ = send_trader_change_balance_request(&state.kafka_producer,
                                                        payment.trader_id,
                                                        abs(amount_to_froze),
@@ -301,7 +302,6 @@ where T: From<FullPayment>
         },
         None => repository::payment::close_payment_by_hand(&mut pg, &issuer, payment_id).await?
     };
-    println!("{:?}",payment.updated_at);
     send_kafka_message(&state.kafka_producer, payment.clone()).await;
     Ok(T::from(payment))
 }
