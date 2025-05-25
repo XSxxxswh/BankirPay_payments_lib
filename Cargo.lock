@@ -209,6 +209,7 @@ dependencies = [
  "jemallocator",
  "lazy_static",
  "prost",
+ "prost-types",
  "rdkafka",
  "redis",
  "rust_decimal",

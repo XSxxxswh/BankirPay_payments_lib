@@ -3,7 +3,7 @@ use std::ops::{Deref};
 use std::sync::Arc;
 use std::time::Duration;
 use bankirpay_lib::errors::LibError;
-use bankirpay_lib::map_err_with_log;
+use bankirpay_lib::{map_err_with_log, trader_proto};
 use bankirpay_lib::models::payments::merchant::MerchantPayment;
 use bankirpay_lib::models::payments::payment::{FeeTypes, FullPayment, NewPaymentRequest, PaymentSides, PaymentStatuses, ToSQL};
 use bankirpay_lib::models::payments::payment_proto::PaymentProto;
@@ -12,11 +12,12 @@ use bankirpay_lib::models::payments::trader::TraderPaymentBuilder;
 use bankirpay_lib::requisites_proto::Requisite;
 use bankirpay_lib::services::traders::trader_service::TraderService;
 use bankirpay_lib::trader_proto::BalanceActionType;
+use bigdecimal::num_traits::abs;
 use futures::stream::FuturesUnordered;
 use prost::Message;
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::Message as RdkMessage;
-use rdkafka::producer::FutureProducer;
+use rdkafka::producer::{FutureProducer, FutureRecord};
 use redis::aio::MultiplexedConnection;
 use rust_decimal::{dec, Decimal};
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
@@ -283,7 +284,20 @@ where T: From<FullPayment>
         Some(final_amount) => {
             let (tx, mut payment) = repository::payment::get_payment_for_recalculate(&mut pg, payment_id, &issuer).await?;
             recalculate_payment(&mut payment, final_amount).await?;
-            repository::payment::close_recalculated_payment(tx, &payment, &issuer).await?
+            let final_payment = repository::payment::close_recalculated_payment(tx, &payment, &issuer).await?;
+            match payment.status {
+                c if !c.is_final() => {
+                    let amount_to_froze = final_payment.trader_crypto_amount - payment.trader_crypto_amount;
+                    let _ = send_trader_change_balance_request(&state.kafka_producer,
+                                                       payment.trader_id,
+                                                       abs(amount_to_froze),
+                                                       if amount_to_froze > dec!(0) {BalanceActionType::FrozeHard}else{BalanceActionType::Unfroze}).await;
+                    // если заявка еще в процессе значит баланс трейдера еще заморожен
+                    // если финальная сумма больше чем исходная, то замораживаем разницу если меньше, то размораживаем
+                }
+                _ => {}
+            }
+            final_payment
         },
         None => repository::payment::close_payment_by_hand(&mut pg, &issuer, payment_id).await?
     };
@@ -333,17 +347,17 @@ pub async fn send_kafka_message(producer: &FutureProducer, payment: FullPayment)
             }
         }
     }
-   
+
 }
 
-async fn recalculate_payment(payment: &mut FullPayment, amount: Decimal) 
+async fn recalculate_payment(payment: &mut FullPayment, amount: Decimal)
 -> Result<(), PaymentError>
 {
     payment.fiat_amount = amount;
     let fee_percent = payment.margin / dec!(100);
-    let builder = calculate_trader_fee(amount, 
-                                       payment.trader_margin, 
-                                       payment.exchange_rate, 
+    let builder = calculate_trader_fee(amount,
+                                       payment.trader_margin,
+                                       payment.exchange_rate,
                                        &payment.payment_side)?;
     payment.trader_crypto_fee = builder.trader_crypto_fee;
     payment.trader_fiat_fee = builder.trader_fiat_fee;
@@ -385,4 +399,38 @@ pub async fn kafka_worker_start(consumer: StreamConsumer, state: Arc<models::Sta
             }
             consumer.commit_message(&message, CommitMode::Async).unwrap();
         }
+}
+
+async fn send_trader_change_balance_request(producer: &FutureProducer, trader_id:String, amount: Decimal,
+                                            balance_action_type: trader_proto::BalanceActionType)
+-> Result<(), PaymentError>
+{
+    let request = trader_proto::ChangeBalanceRequest{
+        trader_id: trader_id.clone(),
+        amount: amount.to_f64().ok_or(PaymentError::InvalidAmount)?,
+        action_type: balance_action_type.into(),
+        idempotent_key: Uuid::now_v7().to_string(),
+    };
+    let buff = request.encode_to_vec();
+    for i in 0..3 {
+        if i > 0 {
+            warn!("Trader change balance kafka send retry attempt {}", i);
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        }
+        let record = FutureRecord::to("trader_change_balance")
+            .key(&trader_id)
+            .payload(&buff);
+        match producer.send(record, Duration::from_secs(5)).await {
+            Ok(f) => {
+                debug!("Sent trader change balance kafka {:?}", f);
+                return Ok(())
+            },
+            Err((e, _)) => {
+                error!(err=e.to_string(), "Error sending trader change balance kafka");
+                continue
+            }
+        }
+    }
+    error!("retry count exceeded");
+    Err(InternalServerError)
 }
