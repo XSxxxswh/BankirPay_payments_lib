@@ -9,6 +9,7 @@ use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::Message as RdkMessage;
 use rdkafka::message::BorrowedMessage;
 use rdkafka::producer::{FutureProducer, FutureRecord};
+use rdkafka::util::Timeout;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use tracing::{debug, error, warn};
@@ -27,20 +28,30 @@ pub async fn kafka_worker_start(consumer: StreamConsumer, state: Arc<models::Sta
             continue;
         }
         let mut stream = consumer.stream();
-        while let Some(message) = stream.next().await {
-            match message {
-                Ok(message) => {
+        loop {
+            match tokio::time::timeout(Duration::from_secs(60), stream.next()).await {
+                Ok(Some(Ok(message))) => {
                     handle_kafka_notification_event(state.clone(), &message).await;
-                    let _ = map_err_with_log!(consumer.commit_message(&message, CommitMode::Async),
-                        "Error committing message", InternalServerError, false);
-                },
-                Err(e) => {
-                    error!(err=e.to_string(), "Error receiving message");
+                    let _ = map_err_with_log!(
+                        consumer.commit_message(&message, CommitMode::Async),
+                        "Kafka commit error", InternalServerError, false
+                    );
+                }
+                Ok(Some(Err(e))) => {
+                    error!(err = %e, "Kafka stream error");
+                    break; // переподключение
+                }
+                Ok(None) => {
+                    warn!("Kafka stream ended");
                     break;
-                    // скорее всего ошибка соединения поэтому прерываем цикл while и идем на повторное подключение
+                }
+                Err(_) => {
+                    warn!("Kafka stream timeout after 60s");
+                    break;
                 }
             }
         }
+        tokio::time::sleep(Duration::from_secs(5)).await;
     }
 }
 
@@ -63,18 +74,23 @@ pub(crate) async fn send_trader_change_balance_request(producer: &FutureProducer
         let record = FutureRecord::to("trader_change_balance")
             .key(&trader_id)
             .payload(&buff);
-        match producer.send(record, Duration::from_secs(5)).await {
-            Ok(f) => {
-                debug!("Sent trader change balance kafka {:?}", f);
-                return Ok(())
+        match tokio::time::timeout(Duration::from_millis(300), producer.send(record, Timeout::Never)).await {
+            Ok(Ok(f)) => {
+                debug!("Sending trader change balance kafka send {:?}", f);
+                return Ok(());
             },
-            Err((e, _)) => {
-                error!(err=e.to_string(), "Error sending trader change balance kafka");
+            Ok(Err((e, _))) => {
+                warn!(err=e.to_string(), "Error sending trader change balance kafka. Retrying...");
+                continue
+            },
+            Err(_) => {
+                warn!("Sending trader change balance kafka failed by timeout. Retrying...");
                 continue
             }
         }
     }
-    error!("retry count exceeded");
+    error!(trader_id=trader_id, amount=?amount, action_type=?balance_action_type, 
+        "Kafka send trader balance request error retry count exceeded");
     Err(InternalServerError)
 }
 
@@ -89,18 +105,24 @@ pub async fn send_payment_event_to_kafka(producer: &FutureProducer, payment: Ful
         let record = FutureRecord::to("PAYMENT_EVENTS")
             .key(&id)
             .payload(&payload);
-        match producer.send(record, Duration::from_secs(5)).await {
-            Ok(f) => {
-                debug!("Sent kafka message {:?}", f);
-                break
+        match tokio::time::timeout(Duration::from_millis(300), producer.send(record, Timeout::Never)).await 
+        {
+            Ok(Ok(_)) => {
+                debug!("Sending payment event to kafka kafka send");
+                return;
             },
-            Err((e, _)) => {
-                warn!(err=e.to_string(), "Error sending kafka message");
+            Ok(Err((e, _))) => {
+                warn!(err=e.to_string(), "Error sending payment event to kafka kafka. Retrying...");
+                continue
+            },
+            Err(_) => {
+                warn!("Sending payment event to kafka timeout. Retrying...");
                 continue
             }
         }
+        
     }
-
+    error!(payment_id=id, "Kafka error send event to kafka");
 }
 
 async fn handle_kafka_notification_event(state: Arc<models::State>, message: &BorrowedMessage<'_>)

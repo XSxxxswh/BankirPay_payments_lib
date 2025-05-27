@@ -13,6 +13,7 @@ use crate::errors::payment_error::PaymentError;
 use crate::errors::payment_error::PaymentError::{InternalServerError, NotFound};
 use rust_decimal::prelude::FromPrimitive;
 use simd_json::prelude::ArrayTrait;
+use std::time::Duration;
 
 pub async fn insert_payment_to_db(client: &Client, payment: &FullPayment) -> Result<(), PaymentError>{
     debug!(payment_id=%payment.id, "Inserting new payment to DB");
@@ -41,7 +42,7 @@ pub async fn insert_payment_to_db(client: &Client, payment: &FullPayment) -> Res
             (&payment.earnings, Type::NUMERIC), (&payment.created_at, Type::TIMESTAMP), (&payment.updated_at,Type::TIMESTAMP),
             (&payment.deadline, Type::TIMESTAMP), (&payment.bank_name, Type::VARCHAR), (&payment.last_four, Type::VARCHAR), (&payment.card_last_four, Type::VARCHAR),]
     ), 3).map_err(|e| {
-        error!(err=e.to_string(),"Error save payment");
+        error!(err=e,"Error save payment");
         InternalServerError
     })?;
     if start.elapsed().as_millis() > 10 {
@@ -108,7 +109,7 @@ where T: From<tokio_postgres::Row> + ToSQL
     query.push_str(&query_conditions);
     debug!("executing query {}", query);
     let stream = retry!(client.query_typed_raw(&query, params.clone()), 3).map_err(|e|{
-        error!(err=e.to_string(),"Error getting payments from DB");
+        error!(err=e,"Error getting payments from DB");
         InternalServerError
     })?;
     let mut payments = Vec::<T>::with_capacity(request.get_requested_limit());
@@ -295,7 +296,7 @@ pub async fn cancel_payment_auto(client: &Client)
         "UPDATE payments SET status = 'CANCELLED_BY_TIMEOUT', updated_at= NOW() WHERE deadline < NOW() AND payment_side = 'BUY' AND status IN ('UNPAID', 'PAID') RETURNING *",
         &[]
     ),3).map_err(|e| {
-        error!(err=e.to_string(), "Error cancel payments in DB");
+        error!(err=e, "Error cancel payments in DB");
         InternalServerError
     })?;
     Ok(result.into_iter().map(FullPayment::from).collect::<Vec<FullPayment>>())

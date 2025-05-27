@@ -8,7 +8,7 @@ use tokio_postgres::types::Type;
 use tracing::{debug, error, warn};
 use crate::errors::payment_error::PaymentError;
 use crate::errors::payment_error::PaymentError::InternalServerError;
-
+use std::time::Duration;
 
 pub async fn check_amount_is_available_in_db(client: &tokio_postgres::Client, requisite_id: & str, amount: Decimal, limit: i32)
                                              -> Result<bool, PaymentError>
@@ -20,7 +20,7 @@ pub async fn check_amount_is_available_in_db(client: &tokio_postgres::Client, re
             WHERE requisite_id = $1 AND payment_side = 'BUY' AND status IN ('UNPAID', 'PAID')",
         &[(&requisite_id, Type::VARCHAR)]
     ), 3).map_err(|e| {
-        error!(requisite_id=requisite_id, amount=amount.to_string(), err=e.to_string(), "get amounts error");
+        error!(requisite_id=requisite_id, amount=amount.to_string(), err=e, "get amounts error");
         InternalServerError
     })?;
     if amounts.len() >= limit as usize {
