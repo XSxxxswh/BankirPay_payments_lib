@@ -1,11 +1,10 @@
-use std::sync::Arc;
 use redis::aio::MultiplexedConnection;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::FromPrimitive;
-use tracing::{debug, error, warn};
+use tracing::warn;
 use crate::errors::payment_error::PaymentError;
 use crate::errors::payment_error::PaymentError::InternalServerError;
-use crate::{models, repository};
+use crate::{repository};
 use crate::use_case::from_lib_to_pe;
 
 pub async fn get_trader_margin(conn: &mut MultiplexedConnection, mut trader_api: bankirpay_lib::services::traders::trader_service::TraderService, trader_id: &str)

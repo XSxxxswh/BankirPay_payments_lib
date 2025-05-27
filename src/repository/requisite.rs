@@ -1,11 +1,11 @@
+use bankirpay_lib::repository::is_connection_err;
+use bankirpay_lib::retry;
 use bigdecimal::num_traits::abs;
-use deadpool_redis::Connection;
 use redis::aio::MultiplexedConnection;
-use redis::{AsyncCommands, Script};
+use redis::{AsyncCommands};
 use rust_decimal::{dec, Decimal};
-use rust_decimal::prelude::FromPrimitive;
 use tokio_postgres::types::Type;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 use crate::errors::payment_error::PaymentError;
 use crate::errors::payment_error::PaymentError::InternalServerError;
 
@@ -14,12 +14,12 @@ pub async fn check_amount_is_available_in_db(client: &tokio_postgres::Client, re
                                              -> Result<bool, PaymentError>
 {
     debug!(requisite_id=requisite_id,"checking for available amount");
-    let amounts = client.query_typed(
+    let amounts = retry!(client.query_typed(
         "SELECT fiat_amount
             FROM payments
             WHERE requisite_id = $1 AND payment_side = 'BUY' AND status IN ('UNPAID', 'PAID')",
         &[(&requisite_id, Type::VARCHAR)]
-    ).await.map_err(|e| {
+    ), 3).map_err(|e| {
         error!(requisite_id=requisite_id, amount=amount.to_string(), err=e.to_string(), "get amounts error");
         InternalServerError
     })?;
@@ -40,14 +40,13 @@ pub async fn check_amount_is_available_in_db(client: &tokio_postgres::Client, re
 
 pub async fn try_lock(conn: &mut MultiplexedConnection, requisite_id : &str) -> Result<bool, PaymentError> {
     let key = format!("lock:{}", requisite_id);
-    let result: Option<String> = redis::cmd("SET")
+    let result: Option<String> = retry!(redis::cmd("SET")
         .arg(&key)
         .arg("1")
         .arg("NX")
         .arg("EX")
         .arg(5)
-        .query_async(conn)
-        .await
+        .query_async(conn), 3)
         .map_err(|e| {
             error!(requisite_id=requisite_id,"Failed to lock requisite checking: {}", e);
             InternalServerError
@@ -63,7 +62,7 @@ pub async fn try_lock(conn: &mut MultiplexedConnection, requisite_id : &str) -> 
 
 pub async fn release_lock(conn: &mut MultiplexedConnection, requisite_id: &str) -> Result<(), PaymentError> {
     let key = format!("lock:{}", requisite_id);
-    let _ : () =  conn.del(key.as_str()).await.map_err(|e| {
+    let _ : () =  retry!(conn.del(key.as_str()),3).map_err(|e| {
         error!(requisite_id=requisite_id,"Failed to release requisite state: {}", e);
         InternalServerError
     })?;

@@ -1,11 +1,11 @@
-use std::cmp::max;
-use std::ops::Deref;
+use bankirpay_lib::{retry};
+use bankirpay_lib::repository::is_connection_err;
 use bankirpay_lib::device_proto::notification::Notification;
 use bankirpay_lib::{map_err_with_log};
-use bankirpay_lib::models::payments::payment::{FullPayment, PaymentStatuses, ToSQL};
+use bankirpay_lib::models::payments::payment::{FullPayment, ToSQL};
 use bankirpay_lib::models::payments::requests::GetPaymentsRequest;
 use rust_decimal::Decimal;
-use tokio_postgres::{GenericClient, Transaction};
+use tokio_postgres::{Client, Transaction};
 use tokio_postgres::types::{ToSql, Type};
 use tonic::codegen::tokio_stream::StreamExt;
 use tracing::{debug, error, warn};
@@ -14,10 +14,10 @@ use crate::errors::payment_error::PaymentError::{InternalServerError, NotFound};
 use rust_decimal::prelude::FromPrimitive;
 use simd_json::prelude::ArrayTrait;
 
-pub async fn insert_payment_to_db(client: &tokio_postgres::Client, payment: &FullPayment) -> Result<(), PaymentError>{
+pub async fn insert_payment_to_db(client: &Client, payment: &FullPayment) -> Result<(), PaymentError>{
     debug!(payment_id=%payment.id, "Inserting new payment to DB");
     let start = std::time::Instant::now();
-    let _result = client.query_typed(
+    let _result = retry!(client.query_typed(
         "INSERT INTO payments (
          id, external_id, merchant_id, client_id,
          trader_id, requisite_id, bank_id,
@@ -40,41 +40,38 @@ pub async fn insert_payment_to_db(client: &tokio_postgres::Client, payment: &Ful
             (&payment.holder_account, Type::VARCHAR), (&payment.method, Type::VARCHAR), (&payment.margin, Type::NUMERIC), (&payment.trader_margin, Type::NUMERIC),
             (&payment.earnings, Type::NUMERIC), (&payment.created_at, Type::TIMESTAMP), (&payment.updated_at,Type::TIMESTAMP),
             (&payment.deadline, Type::TIMESTAMP), (&payment.bank_name, Type::VARCHAR), (&payment.last_four, Type::VARCHAR), (&payment.card_last_four, Type::VARCHAR),]
-    ).await.map_err(|e| {
-        error!(payment_id=payment.id.deref(), err=e.to_string(), "Error setting new payment in DB");
+    ), 3).map_err(|e| {
+        error!(err=e.to_string(),"Error save payment");
         InternalServerError
     })?;
-    // tx.commit().await.map_err(|e| {
-    //    error!(err=e.to_string(), "Error committing transaction");
-    //    InternalServerError
-    //  })?;
     if start.elapsed().as_millis() > 10 {
         warn!("[SQL] SLOW SAVE REQUISITE {:?}", start.elapsed());
     }
     Ok(())
 }
 
+
 pub async fn get_payment_by_ex_id<T>(client: &tokio_postgres::Client, external_id: &str, request: GetPaymentsRequest)
                                         -> Result<T, PaymentError>
 where T: From<tokio_postgres::Row> + ToSQL
 {
-    let mut query = String::new();
-    let select_query = T::sql();
+    
+    let mut query = T::sql();
     let mut query_params: Vec<(&(dyn ToSql + Sync), Type)> = Vec::with_capacity(2);
     
     let (query_cond, id) = request.single_query(None);
     // если у пользователя есть id, то WHERE уже в query cond
     if let Some(id) = id.as_ref() {
         query_params.push((id, Type::VARCHAR));
-        query = select_query + &query_cond + " AND external_id=$2";
+        query = query + &query_cond + " AND external_id=$2";
     }else {
-        query = select_query + " WHERE external_id=$1";
+        query += " WHERE external_id=$1";
     }
     query_params.push((&external_id, Type::VARCHAR));
     debug!("executing query {}", query);
-    let rows = client.query_typed(
+    let rows = retry!(client.query_typed(
             &query, &query_params
-    ).await;
+    ), 3);
     let result = map_err_with_log!(rows, "Error get payment by external_id", InternalServerError, external_id)?;
     Ok(T::from(result.into_iter().next().ok_or(NotFound)?))
 }
@@ -83,27 +80,26 @@ pub async fn get_payment_by_id<T>(client: &tokio_postgres::Client, payment_id: &
                                      -> Result<T, PaymentError>
 where T: From<tokio_postgres::Row> + ToSQL
 {
-    let mut query = String::new();
-    let select_query = T::sql();
+    let mut query = T::sql();
     let mut query_params: Vec<(&(dyn ToSql + Sync), Type)> = Vec::with_capacity(2);
     let (query_cond, id) = request.single_query(None);
     if let Some(id) = id.as_ref() {
         query_params.push((id, Type::VARCHAR));
-        query = select_query + &query_cond + " AND id=$2";
+        query = query + &query_cond + " AND id=$2";
     }else {
-        query = select_query + " WHERE id=$1";
+        query = query + " WHERE id=$1";
     }
     debug!("executing query {}", query);
     query_params.push((&payment_id, Type::VARCHAR));
-    let rows = client.query_typed(
+    let rows = retry!(client.query_typed(
         &query, &query_params
-    ).await;
+    ),3);
     let result = map_err_with_log!(rows, "Error get payment by external_id", InternalServerError, payment_id)?;
     Ok(T::from(result.into_iter().next().ok_or(NotFound)?))
 }
 
 
-pub async fn get_payments<T>(client: &tokio_postgres::Client, request: GetPaymentsRequest)
+pub async fn get_payments<T>(client: &Client, request: GetPaymentsRequest)
 -> Result<Vec<T>, PaymentError>
 where T: From<tokio_postgres::Row> + ToSQL
 {
@@ -111,7 +107,7 @@ where T: From<tokio_postgres::Row> + ToSQL
     let (query_conditions, params) = request.to_sql();
     query.push_str(&query_conditions);
     debug!("executing query {}", query);
-    let stream = client.query_typed_raw(&query, params).await.map_err(|e|{
+    let stream = retry!(client.query_typed_raw(&query, params.clone()), 3).map_err(|e|{
         error!(err=e.to_string(),"Error getting payments from DB");
         InternalServerError
     })?;
@@ -124,7 +120,7 @@ where T: From<tokio_postgres::Row> + ToSQL
 }
 
 
-pub async fn close_payment(client: &mut tokio_postgres::Client, notify: &bankirpay_lib::device_proto::Notification)
+pub async fn close_payment(client: &mut Client, notify: &bankirpay_lib::device_proto::Notification)
                            -> Result<FullPayment, PaymentError>
 {
     if let Some(Notification::Event(f)) = notify.notification.as_ref() {
@@ -162,6 +158,7 @@ pub async fn close_payment(client: &mut tokio_postgres::Client, notify: &bankirp
         if ids.is_empty() || ids.len() > 1 {
             return Err(NotFound);
         }
+        
         let row = tx.query_typed("UPDATE payments SET status = 'COMPLETED', close_by = 'AUTO', updated_at = NOW() WHERE id = $1 RETURNING *",
         &[(&ids[0], Type::VARCHAR)]).await.map_err(|e|{
             error!(err=e.to_string(),"Error update payment status");
@@ -176,7 +173,7 @@ pub async fn close_payment(client: &mut tokio_postgres::Client, notify: &bankirp
     Err(NotFound)
 }
 
-pub async fn close_payment_by_hand(client: &tokio_postgres::Client, issuer: &GetPaymentsRequest, payment_id: &str)
+pub async fn close_payment_by_hand(client: &Client, issuer: &GetPaymentsRequest, payment_id: &str)
 -> Result<FullPayment, PaymentError>
 {
     let mut query = String::from("UPDATE payments SET status = 'COMPLETED', close_by = $1, updated_at = NOW()");
@@ -198,7 +195,7 @@ pub async fn close_payment_by_hand(client: &tokio_postgres::Client, issuer: &Get
     'CANCELLED_BY_ADMIN', 'CANCELLED_BY_ADMIN', 'CANCELLED_BY_TRADER', \
     'CANCELLED_BY_MERCHANT', 'CANCELLED_BY_CUSTOMER') RETURNING *");
     debug!("executing query {}", query);
-    let rows = map_err_with_log!(client.query_typed(&query, &query_params).await, 
+    let rows = map_err_with_log!(retry!(client.query_typed(&query, &query_params), 3), 
         "Error start SQL transaction to close payment", 
         InternalServerError, 
         payment_id)?;
@@ -209,7 +206,7 @@ pub async fn close_payment_by_hand(client: &tokio_postgres::Client, issuer: &Get
 }
 
 // получение платежа для перерасчета (открывается транзакция и она возвращается)
-pub async fn get_payment_for_recalculate<'a>(client: &'a mut tokio_postgres::Client, payment_id: &str, request: &GetPaymentsRequest)
+pub async fn get_payment_for_recalculate<'a>(client: &'a mut Client, payment_id: &str, request: &GetPaymentsRequest)
 -> Result<(Transaction<'a>,FullPayment), PaymentError>
 {
     let mut query = String::from("SELECT * FROM payments");
@@ -291,13 +288,13 @@ pub async fn close_recalculated_payment(tx: Transaction<'_>, payment: &FullPayme
     map_err_with_log!(tx.commit().await, "Error committing transaction to payment", InternalServerError, payment_id)?;
     Ok(FullPayment::from(rows.first().unwrap()))
 }
-pub async fn cancel_payment_auto(client: &tokio_postgres::Client)
+pub async fn cancel_payment_auto(client: &Client)
                                  -> Result<Vec<FullPayment>, PaymentError>
 {
-    let result = client.query_typed(
+    let result = retry!(client.query_typed(
         "UPDATE payments SET status = 'CANCELLED_BY_TIMEOUT', updated_at= NOW() WHERE deadline < NOW() AND payment_side = 'BUY' AND status IN ('UNPAID', 'PAID') RETURNING *",
         &[]
-    ).await.map_err(|e| {
+    ),3).map_err(|e| {
         error!(err=e.to_string(), "Error cancel payments in DB");
         InternalServerError
     })?;
@@ -319,3 +316,4 @@ fn get_close_by_for_sql(request: &GetPaymentsRequest)
         }
     }
 }
+

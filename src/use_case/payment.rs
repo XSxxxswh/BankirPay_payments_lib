@@ -1,12 +1,8 @@
-use std::cmp::PartialEq;
 use std::ops::{Deref};
 use std::sync::Arc;
-use std::time::Duration;
 use bankirpay_lib::errors::LibError;
-use bankirpay_lib::{map_err_with_log, trader_proto};
 use bankirpay_lib::models::payments::merchant::MerchantPayment;
-use bankirpay_lib::models::payments::payment::{FeeTypes, FullPayment, NewPaymentRequest, PaymentSides, PaymentStatuses, ToSQL};
-use bankirpay_lib::models::payments::payment_proto::PaymentProto;
+use bankirpay_lib::models::payments::payment::{FeeTypes, FullPayment, NewPaymentRequest, PaymentSides, ToSQL};
 use bankirpay_lib::models::payments::requests::GetPaymentsRequest;
 use bankirpay_lib::models::payments::trader::TraderPaymentBuilder;
 use bankirpay_lib::requisites_proto::Requisite;
@@ -14,38 +10,31 @@ use bankirpay_lib::services::traders::trader_service::TraderService;
 use bankirpay_lib::trader_proto::BalanceActionType;
 use bigdecimal::num_traits::abs;
 use futures::stream::FuturesUnordered;
-use prost::Message;
-use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
-use rdkafka::Message as RdkMessage;
-use rdkafka::producer::{FutureProducer, FutureRecord};
 use redis::aio::MultiplexedConnection;
 use rust_decimal::{dec, Decimal};
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
-use tokio_postgres::Notification;
 use tokio_util::sync::CancellationToken;
 use tonic::codegen::tokio_stream::StreamExt;
-use tracing::{debug, error, warn};
-use tracing::field::debug;
+use tracing::{debug, error};
 use uuid::Uuid;
 use crate::errors::payment_error::PaymentError;
-use crate::errors::payment_error::PaymentError::{InternalServerError, InvalidAmount, InvalidCurrency, NoAvailableRequisites, NotFound, SellPaymentsUnavailable};
 use crate::models::{LockGuard, State};
 use crate::{models, repository, use_case};
 use crate::repository::requisite::release_lock;
-use crate::use_case::from_lib_to_pe;
+use crate::use_case::{from_lib_to_pe, get_db_conn, get_rdb_conn, kafka};
 
 pub async fn new_payment (state: Arc<State>, merchant_id: String, request: NewPaymentRequest) -> Result<MerchantPayment, PaymentError> {
     let (merchant_margin, exchange_rate) = tokio::try_join!(use_case::merchant::get_merchant_margin(state.clone(), merchant_id.as_str(), request.method_id.deref()), use_case::exchange_rate::get_exchange_rate(state.clone()))?;
     if merchant_margin.currency.to_lowercase() != request.currency.to_lowercase() {
-        return Err(InvalidCurrency)
+        return Err(PaymentError::InvalidCurrency)
     }
     let cb_allow = match (merchant_margin.cb_allow, merchant_margin.cross_border) {
         (true, true) => Some(true),
         (true, false) => None,
         _ => Some(false),
     };
-    let mut conn = state.rdb.get().await.unwrap();
-    let pg = Arc::new(state.pool.get().await.map_err(|_| InternalServerError)?);
+    let mut conn = get_rdb_conn(&state.rdb).await?;
+    let pg = Arc::new(get_db_conn(&state.pool).await?);
     let mut payment = calculate_fee_for_merchant(request, &merchant_margin, exchange_rate, merchant_id)?;
     let requisites = state.requisite_api.clone().get_requisites_for_payment(merchant_margin.method_type, payment.fiat_amount.to_f64().unwrap(), payment.currency.to_string(), merchant_margin.bank, cb_allow).await.map_err(from_lib_to_pe)?;
     let chunks = requisites.chunks((requisites.len() / 4).max(1));
@@ -82,7 +71,7 @@ pub async fn new_payment (state: Arc<State>, merchant_id: String, request: NewPa
                     continue;
                 }else {
                     error!(err=?err, "Error withdrawal trader balance");
-                    return Err(InternalServerError)
+                    return Err(PaymentError::InternalServerError)
                 }
             }
             payment.trader_margin = trader_builder.trader_margin;
@@ -105,7 +94,7 @@ pub async fn new_payment (state: Arc<State>, merchant_id: String, request: NewPa
             return Ok(MerchantPayment::from(payment));
         }
     }
-    Err(NoAvailableRequisites)
+    Err(PaymentError::NoAvailableRequisites)
 }
 
 
@@ -153,7 +142,7 @@ fn calculate_fee_for_merchant(
         return Err(PaymentError::SellPaymentsUnavailable);
     }
 
-    let margin = Decimal::from_f64(fee.buy_margin).ok_or(InvalidAmount)?;
+    let margin = Decimal::from_f64(fee.buy_margin).ok_or(PaymentError::InvalidAmount)?;
     let fee_percent = margin / dec!(100); // Используем dec! из rust_decimal_macros
 
     let fiat_fee = (request.target_amount * fee_percent).round_dp(2);
@@ -227,10 +216,7 @@ pub async fn get_payments<T>(state: Arc<models::State>, request: GetPaymentsRequ
 where T: From<tokio_postgres::Row> + ToSQL
 {
     debug!("Getting payments");
-    let pg = state.pool.get().await.map_err(|e| {
-        error!(err=e.to_string(), "Error getting DB connection");
-        InternalServerError
-    })?;
+    let pg = get_db_conn(&state.pool).await?;
     repository::payment::get_payments(&pg, request).await
 }
 
@@ -239,10 +225,7 @@ pub async fn get_payment_by_id<T>(state: Arc<models::State>, payment_id: &str, r
 where T: From<tokio_postgres::Row> + ToSQL
 {
     debug!(payment_id=payment_id, "Getting payment by id");
-    let pg = state.pool.get().await.map_err(|e|{
-        error!(payment_id=payment_id,err=e.to_string(), "Error get DB conn");
-        InternalServerError
-    })?;
+    let pg = get_db_conn(&state.pool).await?;
     let payment = repository::payment::get_payment_by_id(&pg, payment_id, request).await?;
     Ok(payment)
 }
@@ -253,10 +236,7 @@ pub async fn get_payment_by_external_id<T>(state: Arc<models::State>, ex_payment
 where T: From<tokio_postgres::Row> + ToSQL
 {
     debug!(external_id=ex_payment_id, "Getting payment by ex id");
-    let pg = state.pool.get().await.map_err(|e|{
-        error!(external_id=ex_payment_id,err=e.to_string(), "Error get DB conn");
-        InternalServerError
-    })?;
+    let pg = get_db_conn(&state.pool).await?;
     let payment = repository::payment::get_payment_by_ex_id(&pg, ex_payment_id, request).await?;
     Ok(payment)
 }
@@ -265,12 +245,9 @@ where T: From<tokio_postgres::Row> + ToSQL
 pub async fn close_payment_by_notification(state: Arc<models::State>, notification: &bankirpay_lib::device_proto::Notification)
 -> Result<(), PaymentError>
 {
-    let mut pg = state.pool.get().await.map_err(|e|{
-        error!(err=e.to_string(), "Error get DB conn");
-        InternalServerError
-    })?;
+    let mut pg = get_db_conn(&state.pool).await?;
     let payment = repository::payment::close_payment(&mut pg, notification).await?;
-    send_kafka_message(&state.kafka_producer, payment).await;
+    kafka::send_payment_event_to_kafka(&state.kafka_producer, payment).await;
     Ok(())
 }
 
@@ -279,7 +256,7 @@ pub async fn close_payment_by_hand<T>(state: Arc<models::State>, issuer: GetPaym
 where T: From<FullPayment>
 {
     debug!(payment_id=payment_id,issuer=?issuer,"Closing payment by hand");
-    let mut pg = map_err_with_log!(state.pool.get().await, "Error get pg connection to close payment", InternalServerError, payment_id)?;
+    let mut pg = get_db_conn(&state.pool).await?;
     let payment = match final_amount {
         Some(final_amount) => {
             let (tx, mut payment) = repository::payment::get_payment_for_recalculate(&mut pg, payment_id, &issuer).await?;
@@ -287,22 +264,22 @@ where T: From<FullPayment>
             recalculate_payment(&mut payment, final_amount).await?;
             let final_payment = repository::payment::close_recalculated_payment(tx, &payment, &issuer).await?;
             match payment.status {
+                // если заявка еще в процессе значит баланс трейдера еще заморожен
                 c if !c.is_final() => {
                     let amount_to_froze = final_payment.trader_crypto_amount - previous_amount;
-                    let _ = send_trader_change_balance_request(&state.kafka_producer,
+                    let _ = kafka::send_trader_change_balance_request(&state.kafka_producer,
                                                        payment.trader_id,
                                                        abs(amount_to_froze),
                                                        if amount_to_froze > dec!(0) {BalanceActionType::FrozeHard}else{BalanceActionType::Unfroze}).await;
-                    // если заявка еще в процессе значит баланс трейдера еще заморожен
-                    // если финальная сумма больше чем исходная, то замораживаем разницу если меньше, то размораживаем
+                    // если финальная сумма больше чем исходная, то замораживаем разницу, если меньше, то размораживаем
                 }
                 _ => {}
             }
             final_payment
         },
-        None => repository::payment::close_payment_by_hand(&mut pg, &issuer, payment_id).await?
+        None => repository::payment::close_payment_by_hand(&pg, &issuer, payment_id).await?
     };
-    send_kafka_message(&state.kafka_producer, payment.clone()).await;
+    kafka::send_payment_event_to_kafka(&state.kafka_producer, payment.clone()).await;
     Ok(T::from(payment))
 }
 
@@ -311,45 +288,20 @@ pub async fn auto_cancel_worker(state: Arc<State>)
 {
     loop {
         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-        let pg = match state.pool.get().await {
+        let pg = match get_db_conn(&state.pool).await {
             Ok(pg) => pg,
-            Err(e) => {
-                error!(err=e.to_string(), "error get DB conn");
+            Err(_) => {
+                error!("Error get DB conn");
                 continue;
             }
         };
         let payments = repository::payment::cancel_payment_auto(&pg).await.unwrap_or(vec![]);
         for payment in payments.into_iter() {
-            send_kafka_message(&state.kafka_producer, payment).await;
+           kafka::send_payment_event_to_kafka(&state.kafka_producer, payment).await;
         }
     }
 }
 
-
-pub async fn send_kafka_message(producer: &FutureProducer, payment: FullPayment) {
-    let id = payment.id.clone();
-    let payload = PaymentProto::from(payment).encode_to_vec();
-    for i in 0..3 {
-        if i > 0 {
-            warn!("Kafka retry send attempt {}", i);
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        }
-        let record = rdkafka::producer::FutureRecord::to("PAYMENT_EVENTS")
-            .key(&id)
-            .payload(&payload);
-        match producer.send(record, Duration::from_secs(5)).await {
-            Ok(f) => {
-                debug!("Sent kafka message {:?}", f);
-                break
-            },
-            Err((e, _)) => {
-                warn!(err=e.to_string(), "Error sending kafka message");
-                continue
-            }
-        }
-    }
-
-}
 
 async fn recalculate_payment(payment: &mut FullPayment, amount: Decimal)
 -> Result<(), PaymentError>
@@ -382,56 +334,3 @@ async fn recalculate_payment(payment: &mut FullPayment, amount: Decimal)
     Ok(())
 }
 
-pub async fn kafka_worker_start(consumer: StreamConsumer, state: Arc<models::State>)
-{
-        consumer.subscribe(&["BANK_EVENTS"]).unwrap();
-        let mut stream = consumer.stream();
-        while let Some(Ok(message)) = stream.next().await {
-            if let Some(payload) = message.payload() { 
-                let notification = bankirpay_lib::device_proto::Notification::decode(payload).unwrap();
-                if let Err(e) = close_payment_by_notification(state.clone(), &notification).await {
-                    if e != NotFound {
-                        error!(err=e.to_string(), "Error closing payment");
-                        continue
-                    }else {
-                        warn!(bank_id=notification.id,"notification not found");
-                    }
-                }
-            }
-            consumer.commit_message(&message, CommitMode::Async).unwrap();
-        }
-}
-
-async fn send_trader_change_balance_request(producer: &FutureProducer, trader_id:String, amount: Decimal,
-                                            balance_action_type: trader_proto::BalanceActionType)
--> Result<(), PaymentError>
-{
-    let request = trader_proto::ChangeBalanceRequest{
-        trader_id: trader_id.clone(),
-        amount: amount.to_f64().ok_or(PaymentError::InvalidAmount)?,
-        action_type: balance_action_type.into(),
-        idempotent_key: Uuid::now_v7().to_string(),
-    };
-    let buff = request.encode_to_vec();
-    for i in 0..3 {
-        if i > 0 {
-            warn!("Trader change balance kafka send retry attempt {}", i);
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        }
-        let record = FutureRecord::to("trader_change_balance")
-            .key(&trader_id)
-            .payload(&buff);
-        match producer.send(record, Duration::from_secs(5)).await {
-            Ok(f) => {
-                debug!("Sent trader change balance kafka {:?}", f);
-                return Ok(())
-            },
-            Err((e, _)) => {
-                error!(err=e.to_string(), "Error sending trader change balance kafka");
-                continue
-            }
-        }
-    }
-    error!("retry count exceeded");
-    Err(InternalServerError)
-}

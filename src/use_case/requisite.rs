@@ -5,7 +5,7 @@ use tracing::{warn};
 use crate::errors::payment_error::PaymentError;
 use crate::{repository};
 use crate::models::{LockGuard};
-use crate::repository::requisite::{release_lock, set_amount_unavailable, try_lock};
+use crate::repository::requisite::{release_lock, set_amount_unavailable};
 pub async fn check_amount_available(client: &tokio_postgres::Client, conn: &mut MultiplexedConnection, requisite_id: &str, amount: Decimal, limit: i32)
                                     -> Result<Option<LockGuard>, PaymentError>
 {

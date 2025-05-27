@@ -4,7 +4,7 @@ use rust_decimal::Decimal;
 use rust_decimal::prelude::FromPrimitive;
 use tracing::error;
 use crate::errors::payment_error::PaymentError;
-use crate::errors::payment_error::PaymentError::{InternalServerError, InvalidAmount};
+use crate::errors::payment_error::PaymentError::{InternalServerError};
 
 pub async fn get_trader_margin_from_redis(conn: &mut MultiplexedConnection, trader_id:&str)
                                           -> Result<Option<Decimal>, PaymentError>

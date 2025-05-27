@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 tokio = {version = "1.44.2", features = ["default"]}
-bankirpay_lib = {git = "https://github.com/XSxxxswh/BankirPay_lib.git", rev = "ba9be8cc84c811069c5f003ba7c5738d702f2490"}
+bankirpay_lib = {git = "https://github.com/XSxxxswh/BankirPay_lib.git", rev = "f59a3a0aa41bed170b06d5f601dfc15bf4851191"}
 serde = {version = "1.0.218", features = ["default"]}
 thiserror = {version = "2.0.11", features = ["default"]}
 axum = {version = "0.8.1", features = ["default", "tokio"]}
