@@ -79,15 +79,6 @@ pub(crate) async fn send_trader_change_balance_request(state: Arc<models::State>
     Ok(())
 }
 
-pub async fn send_payment_event_to_kafka(producer: &FutureProducer, payment: FullPayment) {
-    let id = payment.id.clone();
-    let payload = PaymentProto::from(payment).encode_to_vec();
-    if bankirpay_lib::use_case::kafka::send_kafka_message(producer, "PAYMENT_EVENTS", id.as_str(),  payload.as_slice()).await.is_err() 
-    {
-        error!(payment_id=id, "Kafka error send event to kafka");
-    }
-}
-
 async fn handle_kafka_notification_event(state: Arc<models::State>, message: &BorrowedMessage<'_>)
 {
     if let Some(payload) = message.payload() {
