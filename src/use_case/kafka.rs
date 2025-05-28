@@ -13,7 +13,7 @@ use rdkafka::producer::{FutureProducer};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use tokio_postgres::types::Type;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 use crate::errors::payment_error::PaymentError;
 use crate::errors::payment_error::PaymentError::{InternalServerError, NotFound};
@@ -121,7 +121,7 @@ pub async fn process_outbox_messages(
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 // Получили сигнал завершения
-                log::info!("Received Ctrl+C, shutting down process_outbox_messages gracefully");
+                info!("Received Ctrl+C, shutting down process_outbox_messages gracefully");
                 break;
             }
 
