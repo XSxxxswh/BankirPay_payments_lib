@@ -360,7 +360,7 @@ pub async fn cancel_payment_auto(client: &mut Client)
         payments.push(PaymentProto::from(FullPayment::from(row)));
     };
     drop(rows);
-    for payment in payments.iter() {
+    for payment in payments.into_iter() {
         let _ = map_err_with_log!(retry!(tx.query_typed(
             "INSERT INTO outbox_messages (topic, payload, aggregate_id) VALUES ($1, $2, $3)",
             &[(&"PAYMENT_EVENTS", Type::VARCHAR), (&payment.encode_to_vec(), Type::BYTEA),
