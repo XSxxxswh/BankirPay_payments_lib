@@ -12,6 +12,7 @@ use rdkafka::message::BorrowedMessage;
 use rdkafka::producer::{FutureProducer};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
+use tokio_postgres::GenericClient;
 use tokio_postgres::types::Type;
 use tracing::{error, warn};
 use uuid::Uuid;
@@ -137,7 +138,7 @@ pub async fn process_outbox_messages(
         };
 
         let rows = match tx
-            .query(
+            .query_typed(
                 "SELECT id, topic, payload, aggregate_id FROM outbox_messages WHERE processed_at IS NULL ORDER BY created_at FOR UPDATE SKIP LOCKED",
                 &[],
             )
