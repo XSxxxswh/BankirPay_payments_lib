@@ -52,7 +52,7 @@ impl Drop for LockGuard {
 
 #[derive(Debug)]
 pub struct OutboxMessage {
-    pub id: i32,
+    pub id: String,
     pub topic: String,
     pub payload: Vec<u8>,
     pub aggregate_id: String,

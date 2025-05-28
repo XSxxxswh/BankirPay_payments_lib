@@ -12,7 +12,6 @@ use rdkafka::message::BorrowedMessage;
 use rdkafka::producer::{FutureProducer};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
-use tokio_postgres::GenericClient;
 use tokio_postgres::types::Type;
 use tracing::{error, warn};
 use uuid::Uuid;
