@@ -70,7 +70,7 @@ pub(crate) async fn send_trader_change_balance_request(state: Arc<models::State>
     };
     let payload = request.encode_to_vec();
     let client = map_err_with_log!(get_db_conn(&state.pool).await, "Error get DB connection", InternalServerError, false)?;
-    if repository::payment::add_new_kafka_message(&client, "trader_change_balance", 
+    if repository::payment::add_new_kafka_message(&client, "trader_change_balance",
                                                           &payload, trader_id.as_str()).await.is_err() {
         error!(trader_id=trader_id, amount=?amount, action_type=?balance_action_type,
             "Kafka send trader balance request error retry count exceeded");
