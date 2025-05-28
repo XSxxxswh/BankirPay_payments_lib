@@ -88,7 +88,13 @@ pub async fn new_payment (state: Arc<State>, merchant_id: String, request: NewPa
             payment.card_last_four = requisite.card_last_four;
             payment.earnings = payment.crypto_fee - payment.trader_crypto_fee;
             payment.method = requisite.method;
-            repository::payment::insert_payment_to_db(&pg, &payment).await?;
+            if repository::payment::insert_payment_to_db(&pg, &payment).await.is_err() {
+                error!("Error adding payment to payment db");
+                let _ = use_case::kafka::send_trader_change_balance_request(&state.kafka_producer, 
+                                                                            payment.trader_id.clone(), 
+                                                                            payment.trader_crypto_amount,
+                                                                            BalanceActionType::Unfroze).await;
+            }
             cancellation_token.cancel();
             let _ = release_lock(&mut conn, requisite.id.as_str()).await;
             return Ok(MerchantPayment::from(payment));
@@ -277,7 +283,7 @@ where T: From<FullPayment>
             }
             final_payment
         },
-        None => repository::payment::close_payment_by_hand(&pg, &issuer, payment_id).await?
+        None => repository::payment::close_payment_by_hand(&mut pg, &issuer, payment_id).await?
     };
     kafka::send_payment_event_to_kafka(&state.kafka_producer, payment.clone()).await;
     Ok(T::from(payment))
@@ -288,17 +294,14 @@ pub async fn auto_cancel_worker(state: Arc<State>)
 {
     loop {
         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-        let pg = match get_db_conn(&state.pool).await {
+        let mut pg = match get_db_conn(&state.pool).await {
             Ok(pg) => pg,
             Err(_) => {
                 error!("Error get DB conn");
                 continue;
             }
         };
-        let payments = repository::payment::cancel_payment_auto(&pg).await.unwrap_or(vec![]);
-        for payment in payments.into_iter() {
-           kafka::send_payment_event_to_kafka(&state.kafka_producer, payment).await;
-        }
+        let _ = repository::payment::cancel_payment_auto(&mut pg).await;
     }
 }
 
@@ -333,4 +336,6 @@ async fn recalculate_payment(payment: &mut FullPayment, amount: Decimal)
     }
     Ok(())
 }
+
+
 

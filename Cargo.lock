@@ -211,6 +211,7 @@ dependencies = [
  "futures",
  "jemallocator",
  "lazy_static",
+ "log",
  "prost",
  "prost-types",
  "rdkafka",

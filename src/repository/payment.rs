@@ -14,6 +14,8 @@ use crate::errors::payment_error::PaymentError::{InternalServerError, NotFound};
 use rust_decimal::prelude::FromPrimitive;
 use simd_json::prelude::ArrayTrait;
 use std::time::Duration;
+use bankirpay_lib::models::payments::payment_proto::PaymentProto;
+use prost::Message;
 
 pub async fn insert_payment_to_db(client: &Client, payment: &FullPayment) -> Result<(), PaymentError>{
     debug!(payment_id=%payment.id, "Inserting new payment to DB");
@@ -117,6 +119,7 @@ where T: From<tokio_postgres::Row> + ToSQL
     while let Some(Ok(row)) = stream.as_mut().next().await {
         payments.push(T::from(row));
     }
+    drop(stream);
     Ok(payments)
 }
 
@@ -152,30 +155,38 @@ pub async fn close_payment(client: &mut Client, notify: &bankirpay_lib::device_p
             error!(err=e.to_string(),"Error get DB tx payment");
             InternalServerError
         })?;
-        let ids = tx.query_typed(&query, &query_params).await.map_err(|e|{
-            error!(err=e.to_string(),"Error get DB tx payment");
-            InternalServerError
-        })?.iter().map(|r| r.get(0)).collect::<Vec<String>>();
+        let ids = retry!(tx.query_typed(&query, &query_params), 3)
+            .map_err(|e|{
+                error!(err=e.to_string(),"Error get DB tx payment");
+                InternalServerError
+            })?.iter().map(|r| r.get(0)).collect::<Vec<String>>();
+
         if ids.is_empty() || ids.len() > 1 {
             return Err(NotFound);
         }
-        
-        let row = tx.query_typed("UPDATE payments SET status = 'COMPLETED', close_by = 'AUTO', updated_at = NOW() WHERE id = $1 RETURNING *",
-        &[(&ids[0], Type::VARCHAR)]).await.map_err(|e|{
+        let row = retry!(tx.query_typed(
+            "UPDATE payments SET status = 'COMPLETED', close_by = 'AUTO',\
+             updated_at = NOW() WHERE id = $1 RETURNING *",
+        &[(&ids[0], Type::VARCHAR)]), 3).map_err(|e|{
             error!(err=e.to_string(),"Error update payment status");
             InternalServerError
         })?;
-        tx.commit().await.map_err(|e|{
-            error!(err=e.to_string(),"Error commit transaction");
-            InternalServerError
-        })?;
-        return Ok(FullPayment::from(row.first().ok_or(NotFound)?));
+        let payment = FullPayment::from(row.first().ok_or(NotFound)?);
+        let payment_proto = PaymentProto::from(payment.clone());
+        let _ = map_err_with_log!(retry!(tx.query_typed(
+            "INSERT INTO outbox_messages (topic, payload, aggregate_id) VALUES ($1, $2, $3)",
+            &[(&"PAYMENT_EVENTS", Type::VARCHAR), (&payment_proto.encode_to_vec(), Type::BYTEA),
+                (&payment_proto.id, Type::VARCHAR)]
+            
+        ), 3), "Error insert outbox msg to DB", InternalServerError, false)?;
+        map_err_with_log!(tx.commit().await, "Error committing transaction to payment", InternalServerError, false)?;
+        return Ok(payment);
     }
     Err(NotFound)
 }
 
-pub async fn close_payment_by_hand(client: &Client, issuer: &GetPaymentsRequest, payment_id: &str)
--> Result<FullPayment, PaymentError>
+pub async fn close_payment_by_hand(client: &mut Client, issuer: &GetPaymentsRequest, payment_id: &str)
+                                   -> Result<FullPayment, PaymentError>
 {
     let mut query = String::from("UPDATE payments SET status = 'COMPLETED', close_by = $1, updated_at = NOW()");
     let mut query_params: Vec<(&(dyn ToSql + Sync), Type)> = vec![];
@@ -193,17 +204,27 @@ pub async fn close_payment_by_hand(client: &Client, issuer: &GetPaymentsRequest,
         query.push_str(format!(" WHERE id= ${}", param_index).as_str());
     }
     query.push_str(" AND status IN ('UNPAID', 'PAID', 'CANCELLED_BY_TIMEOUT', \
-    'CANCELLED_BY_ADMIN', 'CANCELLED_BY_ADMIN', 'CANCELLED_BY_TRADER', \
+    'CANCELLED_BY_ADMIN', 'CANCELLED_BY_TRADER', \
     'CANCELLED_BY_MERCHANT', 'CANCELLED_BY_CUSTOMER') RETURNING *");
     debug!("executing query {}", query);
-    let rows = map_err_with_log!(retry!(client.query_typed(&query, &query_params), 3), 
+    let tx = map_err_with_log!(client.transaction().await, "Error create DB transaction", InternalServerError, payment_id)?;
+    let rows = map_err_with_log!(retry!(tx.query_typed(&query, &query_params), 3), 
         "Error start SQL transaction to close payment", 
         InternalServerError, 
         payment_id)?;
     if rows.is_empty() || rows.len() > 1 {
         return Err(NotFound);
     }
-    Ok(FullPayment::from(rows.first().ok_or(NotFound)?))
+    let payment = FullPayment::from(rows.first().ok_or(NotFound)?);
+    let payment_proto = PaymentProto::from(payment.clone());
+    let _ = map_err_with_log!(retry!(tx.query_typed(
+            "INSERT INTO outbox_messages (topic, payload, aggregate_id) VALUES ($1, $2, $3)",
+            &[(&"PAYMENT_EVENTS", Type::VARCHAR), (&payment_proto.encode_to_vec(), Type::BYTEA),
+                (&payment_proto.id, Type::VARCHAR)]
+        ), 3), "Error insert outbox msg to DB", InternalServerError, false)?;
+    
+    map_err_with_log!(tx.commit().await, "Error committing transaction to payment", InternalServerError, payment_id)?;
+    Ok(payment)
 }
 
 // получение платежа для перерасчета (открывается транзакция и она возвращается)
@@ -228,7 +249,7 @@ pub async fn get_payment_for_recalculate<'a>(client: &'a mut Client, payment_id:
     println!("executing query {}", query);
     let tx = map_err_with_log!(client.transaction().await,
         "Error create payment transaction", InternalServerError, payment_id)?;
-    let rows = map_err_with_log!(tx.query_typed(&query, &query_params).await,
+    let rows = map_err_with_log!(retry!(tx.query_typed(&query, &query_params), 3),
         "Error start SQL transaction to close payment",InternalServerError,payment_id)?;
     if rows.is_empty() {
         return Err(NotFound);
@@ -281,25 +302,73 @@ pub async fn close_recalculated_payment(tx: Transaction<'_>, payment: &FullPayme
     'CANCELLED_BY_MERCHANT', 'CANCELLED_BY_CUSTOMER') RETURNING *");
     debug!("executing query {}", query);
     let payment_id = payment.id.clone();
-    let rows = map_err_with_log!(tx.query_typed(&query, &query_params).await,
+    let rows = map_err_with_log!(retry!(tx.query_typed(&query, &query_params), 3),
         "Error update payment in DB", InternalServerError, payment_id)?;
     if rows.is_empty() {
         return Err(NotFound);
     }
+    let payment = FullPayment::from(rows.first().ok_or(NotFound)?);
+    let payment_proto = PaymentProto::from(payment.clone());
+    let _ = map_err_with_log!(retry!(tx.query_typed(
+            "INSERT INTO outbox_messages (topic, payload, aggregate_id) VALUES ($1, $2, $3)",
+            &[(&"PAYMENT_EVENTS", Type::VARCHAR), (&payment_proto.encode_to_vec(), Type::BYTEA),
+                (&payment_proto.id, Type::VARCHAR)]
+        ), 3), "Error insert outbox msg to DB", InternalServerError, false)?;
+    
     map_err_with_log!(tx.commit().await, "Error committing transaction to payment", InternalServerError, payment_id)?;
-    Ok(FullPayment::from(rows.first().unwrap()))
+    Ok(payment)
 }
-pub async fn cancel_payment_auto(client: &Client)
-                                 -> Result<Vec<FullPayment>, PaymentError>
+pub async fn cancel_payment_auto(client: &mut Client)
+                                 -> Result<(), PaymentError>
 {
-    let result = retry!(client.query_typed(
-        "UPDATE payments SET status = 'CANCELLED_BY_TIMEOUT', updated_at= NOW() WHERE deadline < NOW() AND payment_side = 'BUY' AND status IN ('UNPAID', 'PAID') RETURNING *",
-        &[]
-    ),3).map_err(|e| {
-        error!(err=e, "Error cancel payments in DB");
+
+    let tx = map_err_with_log!(client.transaction().await,
+        "Error create transaction", InternalServerError, false)?;
+    let rows = retry!(tx.query_typed(
+    "SELECT * FROM payments
+     WHERE deadline < NOW()
+       AND payment_side = 'BUY'
+       AND status IN ('UNPAID', 'PAID')
+     FOR UPDATE SKIP LOCKED",
+    &[]), 3).map_err(|e| {
+        error!(err = e, "Error selecting payments for cancel");
         InternalServerError
     })?;
-    Ok(result.into_iter().map(FullPayment::from).collect::<Vec<FullPayment>>())
+    // если нет заявок, то возвращаем пустой массив
+    if rows.is_empty() {
+        tx.commit().await.map_err(|e| {
+            error!(err = e.to_string(), "Failed to commit empty cancel tx");
+            InternalServerError
+        })?;
+        return Ok(());
+    }
+    // 2. Собираем ID
+    let ids: Vec<String> = rows.iter().map(|row| row.get("id")).collect();
+    // 3. Обновляем статус
+    let rows = retry!(tx.query_typed_raw(
+    "UPDATE payments
+     SET status = 'CANCELLED_BY_TIMEOUT', updated_at = NOW()
+     WHERE id = ANY($1) RETURNING *",
+    [(&ids, Type::ANY)]
+    ), 3).map_err(|e| {
+        error!(err = e, "Failed to update payment statuses");
+        InternalServerError
+    })?;
+    tokio::pin!(rows);
+    let mut payments = Vec::with_capacity(ids.len());
+    while let Some(Ok(row)) = rows.next().await {
+        payments.push(PaymentProto::from(FullPayment::from(row)));
+    };
+    drop(rows);
+    for payment in payments.iter() {
+        let _ = map_err_with_log!(retry!(tx.query_typed(
+            "INSERT INTO outbox_messages (topic, payload, aggregate_id) VALUES ($1, $2, $3)",
+            &[(&"PAYMENT_EVENTS", Type::VARCHAR), (&payment.encode_to_vec(), Type::BYTEA),
+                (&payment.id, Type::VARCHAR)]
+        ), 3), "Error insert outbox msg to DB", InternalServerError, false)?;
+    }
+    map_err_with_log!(tx.commit().await, "Error committing transaction to payment", InternalServerError, false)?;
+    Ok(())
 }
 
 fn get_close_by_for_sql(request: &GetPaymentsRequest)

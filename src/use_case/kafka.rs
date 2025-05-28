@@ -1,6 +1,7 @@
+use bankirpay_lib::repository::is_connection_err;
 use std::sync::Arc;
 use std::time::Duration;
-use bankirpay_lib::{map_err_with_log, trader_proto};
+use bankirpay_lib::{map_err_with_log, retry, trader_proto};
 use bankirpay_lib::models::payments::payment::FullPayment;
 use bankirpay_lib::models::payments::payment_proto::PaymentProto;
 use futures::StreamExt;
@@ -8,15 +9,17 @@ use prost::Message;
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::Message as RdkMessage;
 use rdkafka::message::BorrowedMessage;
-use rdkafka::producer::{FutureProducer, FutureRecord};
-use rdkafka::util::Timeout;
+use rdkafka::producer::{FutureProducer};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
-use tracing::{debug, error, warn};
+use tokio_postgres::types::Type;
+use tracing::{error, warn};
 use uuid::Uuid;
 use crate::errors::payment_error::PaymentError;
 use crate::errors::payment_error::PaymentError::{InternalServerError, NotFound};
 use crate::models;
+use crate::models::OutboxMessage;
+use crate::use_case::get_db_conn;
 use crate::use_case::payment::{close_payment_by_notification};
 
 pub async fn kafka_worker_start(consumer: StreamConsumer, state: Arc<models::State>)
@@ -106,4 +109,100 @@ async fn handle_kafka_notification_event(state: Arc<models::State>, message: &Bo
             }
         };
     }
+}
+
+
+pub async fn process_outbox_messages(
+    pool: &deadpool_postgres::Pool,
+    producer: &rdkafka::producer::FutureProducer,
+) -> Result<(), Box<dyn std::error::Error>> {
+    loop {
+        // Проверяем сигнал Ctrl+C параллельно с основным циклом
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                // Получили сигнал завершения
+                log::info!("Received Ctrl+C, shutting down process_outbox_messages gracefully");
+                break;
+            }
+
+            _ = async {
+                // Основной блок обработки
+
+                let mut client = match get_db_conn(pool).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        error!("Failed to get DB connection: {}", e);
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        return
+                    }
+                };
+
+                let tx = match client.transaction().await {
+                    Ok(tx) => tx,
+                    Err(e) => {
+                        error!("Failed to start DB transaction: {}", e);
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        return
+                    }
+                };
+
+                let rows = match tx
+                    .query(
+                        "SELECT id, topic, payload, aggregate_id FROM outbox_messages WHERE processed_at IS NULL ORDER BY created_at FOR UPDATE SKIP LOCKED",
+                        &[],
+                    )
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        error!("Failed to query outbox messages: {}", e);
+                        let _ = tx.rollback().await;
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        return
+                    }
+                };
+
+                if rows.is_empty() {
+                    if let Err(e) = tx.commit().await {
+                        error!("Failed to commit empty transaction: {}", e);
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    return
+                }
+
+                for row in &rows {
+                    let msg = OutboxMessage::from(row);
+
+                    match bankirpay_lib::use_case::kafka::send_kafka_message(
+                        producer,
+                        msg.topic.as_str(),
+                        msg.aggregate_id.as_str(),
+                        msg.payload.as_slice(),
+                    )
+                    .await
+                    {
+                        Ok(_) => {
+                            let _ = retry!(tx.query_typed(
+                                "UPDATE outbox_messages SET processed_at = NOW() WHERE id = $1",
+                                &[(&msg.id, Type::UUID)]
+                            ), 3)
+                            .map_err(|e| {
+                                error!("Failed to update processed_at for id {}: {}", msg.id, e);
+                            }); 
+                        }
+                        Err(_) => {
+                            warn!("Failed to send message id {} to Kafka", msg.id);
+                        }
+                    }
+                }
+
+                if let Err(e) = tx.commit().await {
+                    error!("Failed to commit transaction: {}", e);
+                }
+
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            } => {}
+        }
+    }
+    Ok(())
 }

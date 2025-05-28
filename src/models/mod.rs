@@ -1,5 +1,7 @@
+use chrono::{DateTime, Utc};
 use rdkafka::producer::FutureProducer;
 use redis::aio::MultiplexedConnection;
+use tokio_postgres::Row;
 use crate::repository::requisite::release_lock;
 
 
@@ -44,6 +46,29 @@ impl Drop for LockGuard {
             tokio::spawn(async move {
                 let _ = release_lock(&mut conn, id.as_str()).await;
             });
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct OutboxMessage {
+    pub id: i32,
+    pub topic: String,
+    pub payload: Vec<u8>,
+    pub aggregate_id: String,
+    pub created_at: DateTime<Utc>,
+    pub processed_at: DateTime<Utc>,
+}
+
+impl From<&Row> for OutboxMessage {
+    fn from(row: &Row) -> Self {
+        Self {
+            id: row.get("id"),
+            topic: row.get("topic"),
+            payload: row.get("payload"),
+            aggregate_id: row.get("aggregate_id"),
+            created_at: row.get("created_at"),
+            processed_at: row.get("processed_at"),
         }
     }
 }
