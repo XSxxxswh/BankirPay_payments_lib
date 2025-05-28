@@ -117,7 +117,6 @@ pub async fn process_outbox_messages(
                 continue;
             }
         };
-
         let tx = match client.transaction().await {
             Ok(tx) => tx,
             Err(e) => {
@@ -126,14 +125,9 @@ pub async fn process_outbox_messages(
                 continue;
             }
         };
-
-        let rows = match tx
-            .query_typed(
-                "SELECT id, topic, payload, aggregate_id FROM outbox_messages WHERE processed_at IS NULL ORDER BY created_at FOR UPDATE SKIP LOCKED",
-                &[],
-            )
-            .await
-        {
+        let rows = match tx.query_typed(
+                "SELECT id, topic, payload, aggregate_id FROM outbox_messages \
+                WHERE processed_at IS NULL ORDER BY created_at FOR UPDATE SKIP LOCKED", &[]).await {
             Ok(r) => r,
             Err(e) => {
                 error!("Failed to query outbox messages: {}", e);
@@ -142,7 +136,6 @@ pub async fn process_outbox_messages(
                 continue;
             }
         };
-
         if rows.is_empty() {
             if let Err(e) = tx.commit().await {
                 error!("Failed to commit empty transaction: {}", e);
@@ -153,14 +146,8 @@ pub async fn process_outbox_messages(
 
         for row in &rows {
             let msg = OutboxMessage::from(row);
-
-            match bankirpay_lib::use_case::kafka::send_kafka_message(
-                producer,
-                msg.topic.as_str(),
-                msg.aggregate_id.as_str(),
-                msg.payload.as_slice(),
-            )
-                .await
+            match bankirpay_lib::use_case::kafka::send_kafka_message(producer, msg.topic.as_str(), 
+                                                                     msg.aggregate_id.as_str(), msg.payload.as_slice()).await
             {
                 Ok(_) => {
                     let _ = retry!(tx.query_typed(
@@ -176,11 +163,9 @@ pub async fn process_outbox_messages(
                 }
             }
         }
-
         if let Err(e) = tx.commit().await {
             error!("Failed to commit transaction: {}", e);
         }
-
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }

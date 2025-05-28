@@ -349,7 +349,7 @@ pub async fn cancel_payment_auto(client: &mut Client)
     "UPDATE payments
      SET status = 'CANCELLED_BY_TIMEOUT', updated_at = NOW()
      WHERE id = ANY($1) RETURNING *",
-    [(&ids, Type::ANY)]
+    [(&ids, Type::VARCHAR_ARRAY)]
     ), 3).map_err(|e| {
         error!(err = e, "Failed to update payment statuses");
         InternalServerError
