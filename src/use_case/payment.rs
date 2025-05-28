@@ -90,7 +90,7 @@ pub async fn new_payment (state: Arc<State>, merchant_id: String, request: NewPa
             payment.method = requisite.method;
             if repository::payment::insert_payment_to_db(&pg, &payment).await.is_err() {
                 error!("Error adding payment to payment db");
-                let _ = use_case::kafka::send_trader_change_balance_request(&state.kafka_producer, 
+                let _ = use_case::kafka::send_trader_change_balance_request(state, 
                                                                             payment.trader_id.clone(), 
                                                                             payment.trader_crypto_amount,
                                                                             BalanceActionType::Unfroze).await;
@@ -252,8 +252,7 @@ pub async fn close_payment_by_notification(state: Arc<models::State>, notificati
 -> Result<(), PaymentError>
 {
     let mut pg = get_db_conn(&state.pool).await?;
-    let payment = repository::payment::close_payment(&mut pg, notification).await?;
-    kafka::send_payment_event_to_kafka(&state.kafka_producer, payment).await;
+    repository::payment::close_payment(&mut pg, notification).await?;
     Ok(())
 }
 
@@ -273,7 +272,7 @@ where T: From<FullPayment>
                 // если заявка еще в процессе значит баланс трейдера еще заморожен
                 c if !c.is_final() => {
                     let amount_to_froze = final_payment.trader_crypto_amount - previous_amount;
-                    let _ = kafka::send_trader_change_balance_request(&state.kafka_producer,
+                    let _ = kafka::send_trader_change_balance_request(state,
                                                        payment.trader_id,
                                                        abs(amount_to_froze),
                                                        if amount_to_froze > dec!(0) {BalanceActionType::FrozeHard}else{BalanceActionType::Unfroze}).await;
@@ -285,7 +284,6 @@ where T: From<FullPayment>
         },
         None => repository::payment::close_payment_by_hand(&mut pg, &issuer, payment_id).await?
     };
-    kafka::send_payment_event_to_kafka(&state.kafka_producer, payment.clone()).await;
     Ok(T::from(payment))
 }
 

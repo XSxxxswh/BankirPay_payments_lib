@@ -371,6 +371,16 @@ pub async fn cancel_payment_auto(client: &mut Client)
     Ok(())
 }
 
+pub async fn add_new_kafka_message(client: &Client, topic: &str, payload: &[u8], aggregate_id: &str)
+-> Result<(), PaymentError>
+{
+    let _ = map_err_with_log!(retry!(client.query_typed(
+        "INSERT INTO kafka_topics (topic, payload, aggregate_id) VALUES ($1, $2, $3)",
+        &[(&topic, Type::VARCHAR), (&payload.to_vec(), Type::BYTEA), (&aggregate_id, Type::VARCHAR)]
+    ), 3), "Error create new kafka event", InternalServerError, topic, aggregate_id)?;
+    Ok(())
+}
+
 fn get_close_by_for_sql(request: &GetPaymentsRequest)
 -> (&(dyn ToSql + Sync), Type)
 {

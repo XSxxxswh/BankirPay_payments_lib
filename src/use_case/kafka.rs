@@ -17,7 +17,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 use crate::errors::payment_error::PaymentError;
 use crate::errors::payment_error::PaymentError::{InternalServerError, NotFound};
-use crate::models;
+use crate::{models, repository};
 use crate::models::OutboxMessage;
 use crate::use_case::get_db_conn;
 use crate::use_case::payment::{close_payment_by_notification};
@@ -58,7 +58,7 @@ pub async fn kafka_worker_start(consumer: StreamConsumer, state: Arc<models::Sta
     }
 }
 
-pub(crate) async fn send_trader_change_balance_request(producer: &FutureProducer, trader_id:String, amount: Decimal,
+pub(crate) async fn send_trader_change_balance_request(state: Arc<models::State>, trader_id:String, amount: Decimal,
                                                        balance_action_type: trader_proto::BalanceActionType)
                                                        -> Result<(), PaymentError>
 {
@@ -69,8 +69,9 @@ pub(crate) async fn send_trader_change_balance_request(producer: &FutureProducer
         idempotent_key: Uuid::now_v7().to_string(),
     };
     let payload = request.encode_to_vec();
-    if bankirpay_lib::use_case::kafka::send_kafka_message(producer, "trader_change_balance", 
-                                                          trader_id.as_str(), &payload).await.is_err() {
+    let client = map_err_with_log!(get_db_conn(&state.pool).await, "Error get DB connection", InternalServerError, false)?;
+    if repository::payment::add_new_kafka_message(&client, "trader_change_balance", 
+                                                          &payload, trader_id.as_str()).await.is_err() {
         error!(trader_id=trader_id, amount=?amount, action_type=?balance_action_type,
             "Kafka send trader balance request error retry count exceeded");
         return Err(InternalServerError)
